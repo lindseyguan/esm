@@ -512,6 +512,7 @@ class ESM3(nn.Module, ESM3InferenceClient):
         self,
         input: ESMProteinTensor | _BatchedESMProteinTensor,
         config: LogitsConfig = LogitsConfig(),
+        grad: bool = False, # allow gradients?
     ) -> LogitsOutput:
         if not isinstance(input, _BatchedESMProteinTensor):
             # Create batch dimension if necessary.
@@ -527,7 +528,9 @@ class ESM3(nn.Module, ESM3InferenceClient):
             per_res_plddt = input.coordinates.isfinite().all(dim=-1).any(dim=-1).float()
 
         with (
-            torch.no_grad(),  # Assume no gradients for now...
+            torch.no_grad() # Assume no gradients...
+            if not grad
+            else contextlib.nullcontext(),
             torch.autocast(enabled=True, device_type=device.type, dtype=torch.bfloat16)  # type: ignore
             if device.type == "cuda"
             else contextlib.nullcontext(),
