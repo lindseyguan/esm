@@ -1,12 +1,18 @@
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
+import json
+import os
+
 import random
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 from datasets.dataset_dict import DatasetDict, Dataset
 from esm.models.esm3 import ESM3, ESMProtein, LogitsConfig
 from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
 from esm.utils.constants import esm3 as C
 from transformers import Trainer, TrainingArguments, TrainerCallback
-from transformers.trainer_utils import EvalLoopOutput
+from transformers.trainer import TRAINER_STATE_NAME
+from transformers.trainer_utils import EvalLoopOutput, PREFIX_CHECKPOINT_DIR
+from transformers.trainer_callback import ExportableState
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -57,7 +63,6 @@ def featurize(batch,
         feat_batch.append(ft_dict)
     return feat_batch
 
-
 class ESMTrainer(Trainer):
     def __init__(
         self,
@@ -79,10 +84,11 @@ class ESMTrainer(Trainer):
         self.crop_size = crop_size
         self.logits_config = LogitsConfig(sequence=True, 
                                           return_embeddings=False, return_hidden_states=False)
-        self._stored_metrics = []
 
         self.data_featurized = {}
 
+        self._stored_train_loss = torch.tensor(0.0).cpu()
+        
         for split in ['train', 'val']:
             featurized = self.featurize(self.data[split],
                                         model=self.model, 
@@ -97,6 +103,33 @@ class ESMTrainer(Trainer):
             train_dataset=self.data_featurized['train'],
             eval_dataset=self.data_featurized['val'],
         )
+
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        """
+        Log `logs` on the various objects watching training.
+        Uses accumulated loss.
+
+        Args:
+            logs (`Dict[str, float]`):
+                The values to log.
+            start_time (`Optional[float]`):
+                The start of training.
+        """
+        if self.state.epoch is not None:
+            logs["epoch"] = self.state.epoch
+        if self.args.include_num_input_tokens_seen:
+            logs["num_input_tokens_seen"] = self.state.num_input_tokens_seen
+            if start_time is not None:
+                speed_metrics("train", start_time, num_tokens=self.state.num_input_tokens_seen)
+
+        if "loss" in logs: # Only if train loss
+            logs["loss"] = self._stored_train_loss
+        self._stored_train_loss = torch.tensor(0.0).cpu() # Clear accumulated loss
+
+        output = {**logs, **{"step": self.state.global_step}}
+        self.state.log_history.append(output)
+        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
 
     def compute_loss(self,
@@ -116,14 +149,18 @@ class ESMTrainer(Trainer):
 
         masks = torch.cat(inputs['mask'], dim=0).unsqueeze(1)
         outputs = torch.cat(outputs, dim=0)
-        masked_outputs = torch.where(masks, outputs, torch.tensor(0))
+        masked_outputs = torch.where(masks, outputs, torch.tensor(0)).to(torch.float64)
 
         labels = torch.cat(inputs['label'], dim=0)
         one_hot = F.one_hot(labels, num_classes=64)
-        masked_labels = torch.where(masks, one_hot, torch.tensor(0)).to(torch.float16)
+        masked_labels = torch.where(masks, one_hot, torch.tensor(0)).to(torch.float64)
 
-        loss = self.loss_func(masked_outputs, masked_labels)
+        # normalize loss by unmasked length (this is why reduction should be "sum")
+        num_masked = torch.sum(masks).to(torch.float64)
+        loss = self.loss_func(masked_outputs, masked_labels) / num_masked
+        self._stored_train_loss += loss.cpu() # Update accumulated loss
 
+        # Profile memory usage
         # total_free_memory, _ = torch.cuda.mem_get_info(self.device)
         # total_gpu_memory = torch.cuda.get_device_properties(self.device).total_memory
         # print(total_free_memory / 10**9, total_gpu_memory / 10**9)
@@ -151,8 +188,10 @@ class ESMTrainer(Trainer):
         one_hot = F.one_hot(labels, num_classes=64)
         masked_labels = torch.where(masks, one_hot, torch.tensor(0)).to(torch.float16)
 
+        num_masked = torch.sum(masks).to(torch.float16)
         with torch.no_grad():
-            loss = self.loss_func(masked_outputs, masked_labels)
+            # loss = self.loss_func(masked_outputs, masked_labels)
+            loss = self.loss_func(masked_outputs, masked_labels) / num_masked
 
         return (loss, masked_outputs) if return_outputs else loss
 
@@ -174,25 +213,67 @@ class ESMTrainer(Trainer):
         if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
             self.optimizer.eval()
 
-        global_loss = 0
+        global_loss = torch.tensor(0.0).cpu()
+        count = 0
         all_outputs = []
         for batch in dataloader:
             if prediction_loss_only:
                 loss = self.eval_loss(self.model, 
                                       batch, 
-                                      return_outputs=False).detach()
+                                      return_outputs=False).cpu()
                 global_loss += loss
                 outputs = None
             else:
                 loss, outputs = self.eval_loss(self.model, 
                                                batch, 
-                                               return_outputs=True).detach()
+                                               return_outputs=True).cpu()
                 global_loss += loss
                 all_outputs.extend(outputs)
-
+            count += 1
+            if count > 50:
+                break
 
         return EvalLoopOutput(predictions=all_outputs,
                               label_ids=None,
-                              metrics={'eval_loss':global_loss.detach()},
+                              metrics={'eval_loss':global_loss},
                               num_samples=len(dataloader)
                              )
+
+
+    def _save_metrics(self, metrics, output_dir):
+        """
+        Args:
+            metrics (`Dict[str, float]`)
+            output_dir (`str`)
+        Return: None
+        """
+        output_dict = {k: (v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v) for k, v in metrics.items()}
+        with open(os.path.join(output_dir, 'metrics.json'), 'w') as f:
+            json.dump(output_dict, f)
+
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+        # want to save except FullyShardedDDP.
+
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        # print('Saving checkpoint to', output_dir)
+        self.save_model(output_dir, _internal_call=True)
+        if not metrics is None:
+            self._save_metrics(metrics, output_dir)
+
+        if not self.args.save_only_model:
+            # Save optimizer and scheduler
+            self._save_optimizer_and_scheduler(output_dir)
+            self._save_scaler(output_dir)
+            # Save RNG state
+            self._save_rng_state(output_dir)
+
+        # The huggingface version of this function also saves the Trainer state
+        # and maybe removes some older checkpoints.
+        # But that kept not working for me because the self.state.save_to_json()
+        # call was crashing out (Tensor not JSON serializable)
+
